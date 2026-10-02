@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "survey-autopilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automatic first-pass aesthetics engine for the surveying/remote-sensing stack (numpy-only, UI-free)"
 readme = "README.md"
 license = { text = "MIT" }

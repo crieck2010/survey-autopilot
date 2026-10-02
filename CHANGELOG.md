@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-01
+
+### Added
+- `autopilot.compose`: optional trend priors in `search_composition`
+  (`trend_priors=<survey-trends radar dict>`). Validated strictly:
+  must be a dict, `version == 1`, `priors` a dict of str → number with each
+  multiplier in [0.25, 4.0]; anything else → priors ignored entirely with
+  the reason recorded in `"trend_priors_reason"`. When valid, each
+  candidate's `total` is multiplied by the mean prior of its preset's
+  format tags (missing tags count as 1.0); score entries keep both
+  `"total"` (adjusted) and `"total_unadjusted"`, and winner selection uses
+  the adjusted total. `trend_priors=None` is byte-identical to v0.1.0
+  scoring (regression-tested). autopilot never imports survey-trends —
+  the priors dict is caller-supplied (optional-peer direction).
+- `autopilot.compose.PRESET_FORMAT_TAGS`: heuristic preset → format-tag
+  mapping (`dark_strands`/`dark_flow` → particle-flow / flow-field),
+  documented as heuristic; unknown presets score neutrally (1.0), never
+  penalized.
+- `tests/test_compose_priors.py`: 22 tests (winner flip via priors, strict
+  validation, None-identity regression, unknown-preset neutrality,
+  manifest fields).
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

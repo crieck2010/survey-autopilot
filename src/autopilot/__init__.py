@@ -10,9 +10,9 @@ appear in downstream consumers (e.g. seeded strand placement), the seed is
 owned by the caller, not by this package.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-from .compose import DEFAULT_WEIGHTS, score_thumbnail, search_composition
+from .compose import DEFAULT_WEIGHTS, PRESET_FORMAT_TAGS, score_thumbnail, search_composition
 from .density import strand_count_for_bbox
 from .qa import DEFAULT_PLAUSIBLE, QAError, QAReport, qa_field, repair
 from .salience import rank_label_positions, salience_map
@@ -23,6 +23,7 @@ __all__ = [
     "__version__",
     # compose
     "DEFAULT_WEIGHTS",
+    "PRESET_FORMAT_TAGS",
     "score_thumbnail",
     "search_composition",
     # scaling
