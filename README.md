@@ -1,0 +1,184 @@
+# survey-autopilot
+
+**Automatic first-pass aesthetics engine** for the surveying / remote-sensing visualization stack.
+
+`survey-autopilot` answers one question: *what should the first render look like before a human touches it?* It is pure logic — numpy-only, zero survey-\* imports, zero UI-framework imports, duck-typed inputs — so it can be consumed as an optional peer by `survey-viz`, `reel-studio`, or `survey-timescales` without ever creating an import cycle.
+
+Six modules, each independent:
+
+| Module | Job |
+|---|---|
+| `autopilot.compose` | Composition search: render N candidate thumbnails, score them, ship the best ("render 3, ship 1") |
+| `autopilot.scaling` | Robust percentile colormap limits that survive sensor spikes and fill values |
+| `autopilot.qa` | Data QA gate before render: all-NaN steps, out-of-range cells, temporal gaps — plus honest repair |
+| `autopilot.density` | Strand count proportional to map area (calibrated, clamped) |
+| `autopilot.salience` | Salience map + label ranking: labels land near interesting features, off bright clutter |
+| `autopilot.stride` | Phenomenon-aware frame stride (tide / synoptic / seasonal / climate / event) |
+
+Everything is deterministic. Scoring uses no randomness; where downstream consumers need randomness (e.g. seeded strand placement), the seed is owned by the caller, never by this package.
+
+## Install
+
+```bash
+pip install git+https://github.com/crieck2010/survey-autopilot.git
+```
+
+Requires Python ≥ 3.10 and numpy (the only dependency).
+
+## Quickstart
+
+```python
+import numpy as np
+from autopilot import (
+    score_thumbnail, search_composition,
+    robust_limits,
+    qa_field, repair,
+    strand_count_for_bbox,
+    salience_map, rank_label_positions,
+    recommend_stride,
+)
+
+# 1. QA the data before you render it
+field = {
+    "grids": {"speed": speed_grids},   # time as first axis
+    "times": ["2026-01-01T00:00:00Z", ...],
+    "lats": lats, "lons": lons,
+}
+report = qa_field(field, expected_cadence_hours=6)
+if not report.ok:
+    field, report = repair(report, field, policy="drop")  # actions recorded
+
+# 2. Robust colormap limits for the scalar (hue) channel
+limits = robust_limits(field["grids"]["sst"])  # {"vmin", "vmax", "method", ...}
+
+# 3. Strand count for the bbox you're rendering
+strands = strand_count_for_bbox((-165, 15, -55, 72))  # {"count": 3135, ...}
+
+# 4. Stride for the phenomenon
+stride = recommend_stride("synoptic", source="gfs-wind")  # 6-hourly
+
+# 5. Composition search over candidate renders
+result = search_composition(
+    render_thumbnail,  # your callback: (preset, rotation, basemap) -> thumbnail
+    [{"preset": "dark_strands", "rotation": 0, "basemap": "gebco"},
+     {"preset": "dark_strands", "rotation": 15, "basemap": "gebco"}],
+)
+best = result["winner"]
+
+# 6. Label placement on the winner's data
+sal = salience_map(speed_grid, temp_grid)
+labels = rank_label_positions(
+    [{"name": "Hudson Bay", "lon": -85.0, "lat": 55.0}],
+    sal, lats, lons,
+)
+```
+
+## API reference
+
+### `autopilot.compose` — composition search
+
+```python
+def score_thumbnail(thumbnail, label_boxes=None, weights=None) -> dict
+def search_composition(render_thumbnail, candidates, weights=None, label_boxes=None) -> dict
+```
+
+- `thumbnail`: HxWx3 or HxWx4 numpy array, float 0..1 or uint8 0..255 (normalized internally).
+- Scoring (deterministic; default weights `{"coverage": 0.4, "contrast": 0.35, "label_legibility": 0.25}`):
+  - **coverage**: fraction of pixels with max(R,G,B) > 0.05 — a data-vs-near-black-background heuristic.
+  - **contrast**: std of luminance (0.299R+0.587G+0.114B), divided by 0.25 and clipped to [0,1].
+  - **label_legibility**: 1 − mean luminance inside `label_boxes` (labels should sit on dark areas); 0.5 neutral when no boxes given.
+  - **total**: weighted sum.
+- Returns all four components plus the weights used.
+- `search_composition(render_thumbnail, candidates, ...)`: `render_thumbnail(preset, rotation, basemap)` is your callback; each candidate dict carries opaque `preset`/`rotation`/`basemap` values passed straight through (extra keys preserved). Returns `{"winner", "scores" (sorted desc), "weights", "n_candidates"}`. Callback exceptions propagate — the caller owns render errors.
+
+### `autopilot.scaling` — robust auto-scaling
+
+```python
+def robust_limits(values, lo_pct=2.0, hi_pct=98.0) -> dict
+```
+
+- NaN-safe (NaNs/infs ignored). Returns `{"vmin", "vmax", "method", "lo_pct", "hi_pct", "n_total", "n_finite", "clipped_lo_fraction", "clipped_hi_fraction"}`.
+- Degenerate inputs fall back honestly: no finite values → `vmin=0.0, vmax=1.0, method="degenerate-empty"`; constant value c → `vmin=vmax=c, method="degenerate-constant"` (widen before colormapping — a zero-width norm divides by zero). Never raises; the `method` field always tells the truth.
+- Scope: this generalizes the percentile mechanism for the **hue/scalar channel**. `survey-viz` 0.26.1 already uses p99 for the bivariate *brightness* (wind speed) channel — that stays untouched.
+
+### `autopilot.qa` — data QA gate
+
+```python
+@dataclass QAReport  # ok, issues, actions, n_timesteps, checked_vars
+def qa_field(field, plausible=None, expected_cadence_hours=None, outlier_fraction_threshold=0.01) -> QAReport
+def repair(report, field, policy="drop") -> tuple[dict, QAReport]
+class QAError(Exception)
+```
+
+- `field`: dict with `"grids": {varname: array-like, time as first axis}`, `"times": [ISO strings]`, optionally `"lats"`, `"lons"`. Objects with `.to_dict()` are accepted (duck-typed).
+- `plausible`: varname → (lo, hi). Defaults `DEFAULT_PLAUSIBLE = {"u10": (-150,150), "v10": (-150,150), "t2m": (-100,60), "sst": (-5,40), "speed": (0,150)}` — units assumed m/s for winds/speed, °C for temperatures; override when your data differs.
+- Checks: (a) all-NaN timestep per var → `{type:"all_nan", var, index, time}`; (b) out-of-plausible-range cells → `{type:"out_of_range", var, index, fraction}` when the fraction exceeds the threshold; (c) temporal gaps → `{type:"temporal_gap", index, gap_hours, expected_hours}` when a diff exceeds 1.5× the expected cadence (given, else the median diff).
+- `repair` policies: `"drop"` removes flagged timesteps; `"interpolate"` linearly fills isolated single bad steps only (never runs, never across gaps); `"fail"` raises `QAError` if any issues exist. **Never silent**: every action is appended to `report.actions` with its reason. Returns a plain dict of numpy arrays.
+
+### `autopilot.density` — density-by-area strands
+
+```python
+def strand_count_for_bbox(bbox, base_density=0.5, min_count=500, max_count=6000) -> dict
+```
+
+- `bbox`: (min_lon, min_lat, max_lon, max_lat) in degrees. Area = |d_lon| × |d_lat| in deg² (planar approximation — overstates near the poles; fine for density purposes, not a real area measurement).
+- count = round(area × base_density), clamped to [min_count, max_count]. **Calibration**: `base_density=0.5` reproduces ~3000 strands for the North America bbox `(-165, 15, -55, 72)` → area 6270 deg² → **3135 strands** (the count that looked right on the daily winds reel).
+- Returns `{"count", "area_deg2", "density_per_deg2", "method": "area", "clamped"}`. Pure, deterministic.
+
+### `autopilot.salience` — salience-aware labels
+
+```python
+def salience_map(speed, temperature) -> np.ndarray
+def rank_label_positions(candidates, salience, lats, lons, brightness=None, w_salience=1.0, w_brightness=0.5) -> list[dict]
+```
+
+- `salience_map(speed, temperature)`: 2D arrays, same shape. `speed_n = clip(speed / p99(speed), 0, 1)`; `temp_anom = clip(|T − median(T)| / (p99 − p1), 0, 1)`; `salience = 0.6·speed_n + 0.4·temp_anom`, NaN-safe (NaN → 0). Returns float in [0,1].
+- `rank_label_positions`: candidates are `{"name", "lon", "lat", ...}` (extra keys pass through); salience is sampled at the nearest grid cell; score = `w_salience·sal − w_brightness·bri` (brightness optional). Returns copies sorted by score desc with `"salience_score"` added. Deterministic.
+- **Salience ≠ importance.** This is a visual heuristic (fast water, unusual temperature) — not a judgment of what matters. Never let a label rank stand in for domain judgment.
+
+### `autopilot.stride` — phenomenon-aware stride
+
+```python
+STRIDE_TABLE: dict
+def recommend_stride(phenomenon, source=None) -> dict
+```
+
+| Phenomenon | Stride | Why |
+|---|---|---|
+| `tide` | 3-hourly | Tidal constituents (~12.4 h) need sub-daily sampling to stay legible |
+| `synoptic` | 6-hourly (`forecast_hours=(0,6,12,18)`) | Synoptic-scale wind/storm evolution; forecast_hours is GFS-specific |
+| `seasonal` | weekly | Weekly sampling resolves the seasonal cycle without mud |
+| `climate` | monthly | Monthly sampling for multi-year climate context |
+| `event` | per-event (`per_event: True`) | One frame per event, not a fixed cadence |
+
+Unknown phenomena raise `ValueError` listing the valid keys — no silent default. `source` is informational (recorded in the output for future source-specific overrides).
+
+## Interoperability
+
+`survey-autopilot` is an **optional peer**, never a dependency:
+
+- **survey-viz**: call `robust_limits` for the scalar/hue channel before building the colormap norm; call `rank_label_positions` to place labels; call `strand_count_for_bbox` to size strand seeding. survey-viz never imports autopilot internally — the caller wires them together.
+- **reel-studio**: run `qa_field` + `repair` on fetched grids before handing them to the viz pipeline; use `search_composition` with a thumbnail-render callback to pick the preset/rotation/basemap per reel; use `recommend_stride` to choose frame cadence per phenomenon.
+- **survey-timescales**: `recommend_stride` encodes the same phenomenon→cadence mapping its schedulers need, in one place.
+
+No survey-\* package imports this package and this package imports no survey-\* code. The contract is numpy arrays and plain dicts in, plain dicts out.
+
+## Honest limitations
+
+- **Heuristics, not judgments.** Coverage assumes data is brighter than near-black backgrounds; label legibility assumes light text on dark areas; salience is a visual heuristic. Each module documents its assumptions — read them before trusting a first pass on a new dataset.
+- **QA bounds are sanity checks, not climatology.** `DEFAULT_PLAUSIBLE` will not catch a subtly wrong-but-physical value. Override per variable.
+- **Percentile scaling clips real extremes.** If the signal lives in the tails (an extreme event), widen the limits — `clipped_*_fraction` tells you how much you clipped.
+- **`repair(interpolate)` only fills isolated single steps.** Runs of bad data and data adjacent to time gaps are left untouched, honestly.
+- **Density area is planar.** Do not use it as a real area measurement.
+- **Stride table is a starting point.** A stalled storm needs denser sampling than `synoptic` assumes; the caller owns deviations.
+
+## Scaling notes
+
+- All scoring is O(pixels) on thumbnails — render candidates small (e.g. 480px wide) and the search costs a fraction of one full render.
+- `robust_limits` is O(n log n) via `np.percentile`; fine for full grids.
+- `qa_field` scans each grid once per check; `repair` copies grids it modifies.
+- `salience_map` is O(cells); `rank_label_positions` is O(candidates) after the map is built.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Charles Rieck.
